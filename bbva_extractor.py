@@ -141,44 +141,54 @@ def _parsear_movimiento_linea(linea: str) -> Optional[Movimiento]:
     if not linea:
         return None
 
-    m_fecha = PATRON_FECHA.match(linea)
-    if not m_fecha:
+    # Buscar dos fechas al inicio
+    fechas = PATRON_FECHA.findall(linea)
+    if len(fechas) < 2:
         return None
 
-    fecha_oper = m_fecha.group(1)
-    contenido = linea[m_fecha.end():].strip()
+    fecha_oper = fechas[0]
+    fecha_liq = fechas[1]
 
-    # Intento de separación por columnas basadas en varios espacios
-    partes = re.split(r"\s{2,}", contenido)
+    # Remover las fechas del inicio
+    resto = linea
+    for fecha in fechas[:2]:
+        idx = resto.find(fecha)
+        if idx != -1:
+            resto = resto[idx + len(fecha):].strip()
 
-    descripcion = partes[0] if partes else ''
-    referencia = partes[1] if len(partes) > 1 else ''
-    montos_texto = ' '.join(partes[2:]) if len(partes) > 2 else ''
+    # El resto es descripción y montos
+    # Buscar montos al final
+    montos = PATRON_MONTO.findall(resto)
+    if not montos:
+        return None
 
-    montos = PATRON_MONTO.findall(montos_texto)
+    # Asumir que el último monto es el principal (abono o cargo)
+    monto_principal = montos[-1]
 
+    # La descripción es lo antes de los montos
+    descripcion = resto
+    for monto in montos:
+        idx = descripcion.rfind(monto)
+        if idx != -1:
+            descripcion = descripcion[:idx].strip()
+            break
+
+    # Determinar si es cargo o abono (simple: si contiene palabras clave)
+    texto_lower = linea.lower()
     cargo = None
     abono = None
-    if montos:
-        if len(montos) >= 2:
-            cargo = _normalizar_monto(montos[0])
-            abono = _normalizar_monto(montos[1])
-        else:
-            texto_lower = linea.lower()
-            if 'cargo' in texto_lower and 'abono' not in texto_lower:
-                cargo = _normalizar_monto(montos[0])
-            elif 'abono' in texto_lower and 'cargo' not in texto_lower:
-                abono = _normalizar_monto(montos[0])
-            else:
-                abono = _normalizar_monto(montos[0])
+    if 'cargo' in texto_lower or any(m.endswith('-') for m in montos):
+        cargo = _normalizar_monto(monto_principal)
+    else:
+        abono = _normalizar_monto(monto_principal)
 
     tipo = 'CARGO' if cargo else 'ABONO'
 
     return {
         'Fecha_Oper': fecha_oper,
-        'Fecha_Liq': fecha_oper,
+        'Fecha_Liq': fecha_liq,
         'Descripcion': descripcion,
-        'Referencia': referencia,
+        'Referencia': '',  # No separado en este formato
         'Cargo': cargo,
         'Abono': abono,
         'Saldo_Oper': None,
@@ -200,74 +210,30 @@ def _parsear_movimientos_desde_ocr(
     log: LogFunc,
 ) -> List[Movimiento]:
     """Construye movimientos a partir de resultados de EasyOCR."""
-    # Identificar encabezados y sus posiciones
-    header_positions: Dict[str, float] = {}
-    for bbox, texto, _ in resultados:
-        norm = _norm_text(texto)
-        if norm in ('FECHA', 'OPER', 'LIQ', 'LIQUIDACION', 'DESCRIPCION', 'REFERENCIA', 'CARGOS', 'ABONOS', 'OPERACION'):
-            # Guardar la posición X del encabezado
-            header_positions[norm] = bbox[0][0]
-
-    # Desechamos encabezados y construimos filas por posición Y
-    filas: Dict[int, Dict[str, str]] = {}
-
-    # Determinar y de inicio de tabla (después del header)
-    y_min_header = min((bbox[0][1] for bbox, texto, _ in resultados if _norm_text(texto) in ('FECHA', 'OPER', 'LIQ', 'DESCRIPCION')), default=0)
+    # Agrupar por líneas (Y) y ordenar textos por X dentro de cada línea
+    filas: Dict[int, List[Tuple[float, str]]] = {}
 
     for bbox, texto, _ in resultados:
         y_center = (bbox[0][1] + bbox[2][1]) / 2
-        if y_center <= y_min_header + 5:
-            continue
-
-        x_center = (bbox[0][0] + bbox[1][0]) / 2
-        col = _asignar_columna_por_x(x_center, header_positions)
-        if not col:
-            continue
-
-        # Agrupar por línea (redondeo de Y)
+        x_left = bbox[0][0]
+        # Agrupar por línea (redondeo de Y a 10 píxeles)
         y_key = int(round(y_center / 10) * 10)
-        fila = filas.setdefault(y_key, {})
-        fila[col] = (fila.get(col, '') + ' ' + texto).strip()
+        fila = filas.setdefault(y_key, [])
+        fila.append((x_left, texto))
 
     movimientos: List[Movimiento] = []
 
     for y in sorted(filas.keys()):
         fila = filas[y]
-        if not fila:
-            continue
-
-        fecha_oper = fila.get('FECHA') or fila.get('OPER')
-        fecha_liq = fila.get('LIQ')
-        descripcion = fila.get('DESCRIPCION', '')
-        referencia = fila.get('REFERENCIA', '')
-
-        cargo = _normalizar_monto(fila.get('CARGOS'))
-        abono = _normalizar_monto(fila.get('ABONOS'))
-        saldo_oper = _normalizar_monto(fila.get('OPERACION'))
-        saldo_liq = _normalizar_monto(fila.get('LIQUIDACION'))
-
-        # Fallbacks sencillos
-        if not fecha_liq:
-            fecha_liq = fecha_oper
-
-        tipo = 'CARGO' if cargo else 'ABONO'
-
-        if not fecha_oper and not descripcion:
-            continue
-
-        movimientos.append(
-            {
-                'Fecha_Oper': fecha_oper,
-                'Fecha_Liq': fecha_liq,
-                'Descripcion': descripcion,
-                'Referencia': referencia,
-                'Cargo': cargo,
-                'Abono': abono,
-                'Saldo_Oper': saldo_oper,
-                'Saldo_Liq': saldo_liq,
-                'Tipo': tipo,
-            }
-        )
+        # Ordenar por X dentro de la fila
+        fila.sort(key=lambda x: x[0])
+        # Concatenar textos con espacios
+        linea = ' '.join([texto for _, texto in fila])
+        linea = linea.strip()
+        if linea:
+            mov = _parsear_movimiento_linea(linea)
+            if mov:
+                movimientos.append(mov)
 
     return movimientos
 
