@@ -61,32 +61,48 @@ def _normalizar_monto(texto: Optional[str]) -> Optional[float]:
 
 
 def _init_easyocr_reader(log: LogFunc):
-    """Inicializa y devuelve un reader de EasyOCR."""
+    """Inicializa un reader de OCR (EasyOCR o pytesseract)."""
     try:
         import easyocr
-    except ImportError:
-        log('⚠ easyocr no instalado; no se puede hacer OCR en PDF escaneados.')
-        return None
-
-    os.environ.setdefault('SSL_CERT_FILE', certifi.where())
-
-    try:
-        log('🔎 Inicializando EasyOCR...')
+        log('🔎 Usando EasyOCR para OCR...')
         reader = easyocr.Reader(['es'], gpu=False)
-        return reader
+        return ('easyocr', reader)
     except Exception as e:
-        log(f'⚠ Error al inicializar EasyOCR: {e}')
-        return None
+        log(f'EasyOCR no disponible ({e}), intentando pytesseract...')
+        try:
+            import pytesseract
+            from pdf2image import convert_from_path
+            log('🔎 Usando pytesseract para OCR...')
+            return ('pytesseract', None)
+        except Exception as e2:
+            log(f'⚠ pytesseract tampoco disponible ({e2}); no se puede hacer OCR en PDF escaneados.')
+            return None
 
 
-def _texto_desde_ocr(reader, pagina, log: LogFunc) -> Tuple[str, List[Tuple[Tuple[float, float, float, float], str]]]:
-    """Extrae texto de la página con EasyOCR y devuelve texto y cajas."""
-    img = pagina.to_image(resolution=200).original
-    arr = np.array(img)
-    log('🔎 Ejecutando OCR (EasyOCR)...')
-    resultados = reader.readtext(arr)
-    texto = '\n'.join([t for _, t, _ in resultados])
-    return texto, resultados
+def _texto_desde_ocr(reader_type, reader_obj, pagina, log: LogFunc) -> Tuple[str, List[Tuple[Tuple[float, float, float, float], str, float]]]:
+    """Extrae texto de la página con OCR."""
+    if reader_type == 'easyocr':
+        img = pagina.to_image(resolution=200).original
+        arr = np.array(img)
+        log('🔎 Ejecutando OCR (EasyOCR)...')
+        resultados = reader_obj.readtext(arr)
+        texto = '\n'.join([t for _, t, _ in resultados])
+        return texto, resultados
+    elif reader_type == 'pytesseract':
+        from pdf2image import convert_from_path
+        import pytesseract
+        # Convertir página a imagen
+        images = convert_from_path(pagina.file_path, first_page=pagina.page_number+1, last_page=pagina.page_number+1)
+        if not images:
+            return '', []
+        img = images[0]
+        log('🔎 Ejecutando OCR (pytesseract)...')
+        texto = pytesseract.image_to_string(img, lang='spa')
+        # Para compatibilidad, crear resultados dummy
+        resultados = []
+        return texto, resultados
+    else:
+        return '', []
 
 
 def _parsear_encabezado(texto: str) -> InfoCuenta:
@@ -207,35 +223,38 @@ def _asignar_columna_por_x(x: float, header_positions: Dict[str, float]) -> Opti
 
 def _parsear_movimientos_desde_ocr(
     resultados: List[Tuple[Tuple[float, float, float, float], str, float]],
+    texto: str,
     log: LogFunc,
 ) -> List[Movimiento]:
-    """Construye movimientos a partir de resultados de EasyOCR."""
-    # Agrupar por líneas (Y) y ordenar textos por X dentro de cada línea
-    filas: Dict[int, List[Tuple[float, str]]] = {}
+    """Construye movimientos a partir de resultados de OCR o texto plano."""
+    if resultados:  # Si hay resultados de EasyOCR, usar el método anterior
+        filas: Dict[int, List[Tuple[float, str]]] = {}
+        for bbox, texto_bbox, _ in resultados:
+            y_center = (bbox[0][1] + bbox[2][1]) / 2
+            x_left = bbox[0][0]
+            y_key = int(round(y_center / 10) * 10)
+            fila = filas.setdefault(y_key, [])
+            fila.append((x_left, texto_bbox))
 
-    for bbox, texto, _ in resultados:
-        y_center = (bbox[0][1] + bbox[2][1]) / 2
-        x_left = bbox[0][0]
-        # Agrupar por línea (redondeo de Y a 10 píxeles)
-        y_key = int(round(y_center / 10) * 10)
-        fila = filas.setdefault(y_key, [])
-        fila.append((x_left, texto))
-
-    movimientos: List[Movimiento] = []
-
-    for y in sorted(filas.keys()):
-        fila = filas[y]
-        # Ordenar por X dentro de la fila
-        fila.sort(key=lambda x: x[0])
-        # Concatenar textos con espacios
-        linea = ' '.join([texto for _, texto in fila])
-        linea = linea.strip()
-        if linea:
+        movimientos: List[Movimiento] = []
+        for y in sorted(filas.keys()):
+            fila = filas[y]
+            fila.sort(key=lambda x: x[0])
+            linea = ' '.join([texto for _, texto in fila])
+            linea = linea.strip()
+            if linea:
+                mov = _parsear_movimiento_linea(linea)
+                if mov:
+                    movimientos.append(mov)
+        return movimientos
+    else:  # Si no hay resultados (pytesseract), procesar texto línea por línea
+        movimientos: List[Movimiento] = []
+        lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+        for linea in lineas:
             mov = _parsear_movimiento_linea(linea)
             if mov:
                 movimientos.append(mov)
-
-    return movimientos
+        return movimientos
 
 
 def extraer_movimientos_desde_pdf(
@@ -258,7 +277,8 @@ def extraer_movimientos_desde_pdf(
 
             texto = pagina.extract_text() or ''
             if not texto.strip() and reader:
-                texto, resultados = _texto_desde_ocr(reader, pagina, log)
+                reader_type, reader_obj = reader
+                texto, resultados = _texto_desde_ocr(reader_type, reader_obj, pagina, log)
                 if not texto.strip():
                     log("    No se pudo extraer texto en esta página (OCR falló).")
                     continue
@@ -267,7 +287,7 @@ def extraer_movimientos_desde_pdf(
                     info_cuenta = _parsear_encabezado(texto)
                     log("    Encabezado parseado.")
 
-                movs = _parsear_movimientos_desde_ocr(resultados, log)
+                movs = _parsear_movimientos_desde_ocr(resultados, texto, log)
                 movimientos.extend(movs)
                 continue
 
