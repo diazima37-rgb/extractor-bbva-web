@@ -1,0 +1,38 @@
+[global]
+
+# If false, makes your Streamlit script run as a module.
+developmentMode = false
+
+[logger]
+
+# Level of logging: 'error', 'warning', 'info', 'debug'.
+level = "info"
+
+[client]
+
+# Controls whether uncaught app exceptions are displayed in the browser. By
+# default, this is set to True and Streamlit displays app exceptions and
+# associated tracebacks in the browser.
+showErrorDetails = true
+
+[theme]
+
+# The preset Streamlit theme that your custom theme inherits from.
+# One of "light" or "dark".
+base = "light"
+
+# Primary accent color for interactive elements.
+primaryColor = "#004481"
+
+# Background color for the main content area.
+backgroundColor = "#ffffff"
+
+# Background color for sidebar and most interactive widgets.
+secondaryBackgroundColor = "#f0f4f8"
+
+# Color used for almost all text.
+textColor = "#262730"
+
+# Font family for all text in the app, except code blocks. One of "sans serif",
+# "serif", or "monospace".
+font = "sans serif"
