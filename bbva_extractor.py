@@ -3,12 +3,15 @@
 Este módulo expone funciones para leer un estado de cuenta PDF y generar un
 archivo Excel con los movimientos.
 
-El módulo intenta leer texto directamente del PDF usando pdfplumber. Si la página
-está escaneada (imagen), usa EasyOCR para realizar OCR y reconstruir la tabla.
+Usa Claude Vision (Anthropic API) para leer las imágenes del PDF y extraer
+los movimientos en formato JSON. Esta es la solución más robusta para PDFs
+escaneados y funciona en cualquier entorno (incluyendo Streamlit Cloud).
 
 El código está pensado para ser usado desde una GUI (tkinter) u otro front-end.
 """
 
+import base64
+import json
 import os
 import re
 import unicodedata
@@ -18,6 +21,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 import certifi
 import numpy as np
 import pdfplumber
+from pdf2image import convert_from_path
+from anthropic import Anthropic
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -60,52 +65,125 @@ def _normalizar_monto(texto: Optional[str]) -> Optional[float]:
         return None
 
 
-def _init_easyocr_reader(log: LogFunc):
-    """Inicializa un reader de OCR (EasyOCR o pytesseract)."""
+def _get_anthropic_client():
+    """Obtiene el cliente de Anthropic con API key de variable de entorno."""
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise ValueError("❌ Variable de entorno ANTHROPIC_API_KEY no está configurada")
+    return Anthropic(api_key=api_key)
+
+
+def _extraer_movimientos_desde_imagen_claude(
+    imagen_path: str, cliente: Anthropic, log: LogFunc
+) -> Tuple[List[Movimiento], str]:
+    """Envía una imagen de página PDF a Claude Vision y extrae los movimientos."""
+    log("🔎 Enviando imagen a Claude Vision...")
+    
+    # Leer imagen y convertir a base64
+    with open(imagen_path, "rb") as f:
+        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    
+    prompt = """Analiza esta imagen de un estado de cuenta bancario BBVA y extrae todos los movimientos.
+
+Para cada movimiento, extrae:
+- Fecha de operación (ej: 01/DIC)
+- Fecha de liquidación (ej: 01/DIC)
+- Descripción completa del movimiento
+- Monto (número decimal)
+- Tipo: "ABONO" o "CARGO"
+
+Responde SOLO en este formato JSON, sin explicaciones adicionales:
+{
+  "movimientos": [
+    {
+      "fecha_oper": "01/DIC",
+      "fecha_liq": "01/DIC",
+      "descripcion": "DC MAYORISTA,SA DE C",
+      "monto": 2454.18,
+      "tipo": "ABONO"
+    }
+  ],
+  "texto_completo": "todo el texto extraído de la página"
+}
+
+Si no hay movimientos, devuelve {"movimientos": [], "texto_completo": "..."}"""
+
     try:
-        import easyocr
-        log('🔎 Usando EasyOCR para OCR...')
-        reader = easyocr.Reader(['es'], gpu=False)
-        return ('easyocr', reader)
-    except Exception as e:
-        log(f'EasyOCR no disponible ({e}), intentando pytesseract...')
+        response = cliente.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4096,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_data,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ],
+                }
+            ],
+        )
+        
+        # Extraer JSON de la respuesta
+        texto_respuesta = response.content[0].text
+        
+        # Intentar parsear JSON
         try:
-            import pytesseract
-            from pdf2image import convert_from_path
-            log('🔎 Usando pytesseract para OCR...')
-            return ('pytesseract', None)
-        except Exception as e2:
-            log(f'⚠ pytesseract tampoco disponible ({e2}); no se puede hacer OCR en PDF escaneados.')
-            return None
-
-
-def _texto_desde_ocr(reader_type, reader_obj, pagina, log: LogFunc) -> Tuple[str, List[Tuple[Tuple[float, float, float, float], str, float]]]:
-    """Extrae texto de la página con OCR."""
-    if reader_type == 'easyocr':
-        img = pagina.to_image(resolution=200).original
-        arr = np.array(img)
-        log('🔎 Ejecutando OCR (EasyOCR)...')
-        resultados = reader_obj.readtext(arr)
-        texto = '\n'.join([t for _, t, _ in resultados])
-        return texto, resultados
-    elif reader_type == 'pytesseract':
-        from pdf2image import convert_from_path
-        import pytesseract
-        # Convertir página a imagen
-        images = convert_from_path(pagina.file_path, first_page=pagina.page_number+1, last_page=pagina.page_number+1)
-        if not images:
-            return '', []
-        img = images[0]
-        log('🔎 Ejecutando OCR (pytesseract)...')
-        texto = pytesseract.image_to_string(img, lang='spa')
-        # Para compatibilidad, crear resultados dummy
-        resultados = []
-        return texto, resultados
-    else:
-        return '', []
+            # Buscar JSON en la respuesta
+            inicio = texto_respuesta.find('{')
+            fin = texto_respuesta.rfind('}') + 1
+            if inicio >= 0 and fin > inicio:
+                json_str = texto_respuesta[inicio:fin]
+                datos = json.loads(json_str)
+                movimientos = []
+                
+                for mov in datos.get("movimientos", []):
+                    monto = mov.get("monto")
+                    cargo = None
+                    abono = None
+                    
+                    tipo = mov.get("tipo", "ABONO").upper()
+                    if tipo == "CARGO":
+                        cargo = _normalizar_monto(monto)
+                    else:
+                        abono = _normalizar_monto(monto)
+                    
+                    movimientos.append({
+                        "Fecha_Oper": mov.get("fecha_oper", ""),
+                        "Fecha_Liq": mov.get("fecha_liq", ""),
+                        "Descripcion": mov.get("descripcion", ""),
+                        "Referencia": "",
+                        "Cargo": cargo,
+                        "Abono": abono,
+                        "Saldo_Oper": None,
+                        "Saldo_Liq": None,
+                        "Tipo": tipo,
+                    })
+                
+                texto_completo = datos.get("texto_completo", "")
+                return movimientos, texto_completo
+        except json.JSONDecodeError:
+            log(f"⚠ Error parseando JSON de Claude: {texto_respuesta[:200]}")
+            return [], ""
+            
+    except Exception as e:
+        log(f"❌ Error llamando a Claude Vision: {e}")
+        return [], ""
+    
+    return [], ""
 
 
 def _parsear_encabezado(texto: str) -> InfoCuenta:
+    """Extrae información del encabezado del estado de cuenta."""
     info: InfoCuenta = {
         'numero_cuenta': None,
         'periodo': None,
@@ -151,116 +229,10 @@ def _parsear_encabezado(texto: str) -> InfoCuenta:
     return info
 
 
-def _parsear_movimiento_linea(linea: str) -> Optional[Movimiento]:
-    """Extrae un movimiento de una línea de texto."""
-    linea = linea.strip()
-    if not linea:
-        return None
-
-    # Buscar dos fechas al inicio
-    fechas = PATRON_FECHA.findall(linea)
-    if len(fechas) < 2:
-        return None
-
-    fecha_oper = fechas[0]
-    fecha_liq = fechas[1]
-
-    # Remover las fechas del inicio
-    resto = linea
-    for fecha in fechas[:2]:
-        idx = resto.find(fecha)
-        if idx != -1:
-            resto = resto[idx + len(fecha):].strip()
-
-    # El resto es descripción y montos
-    # Buscar montos al final
-    montos = PATRON_MONTO.findall(resto)
-    if not montos:
-        return None
-
-    # Asumir que el último monto es el principal (abono o cargo)
-    monto_principal = montos[-1]
-
-    # La descripción es lo antes de los montos
-    descripcion = resto
-    for monto in montos:
-        idx = descripcion.rfind(monto)
-        if idx != -1:
-            descripcion = descripcion[:idx].strip()
-            break
-
-    # Determinar si es cargo o abono (simple: si contiene palabras clave)
-    texto_lower = linea.lower()
-    cargo = None
-    abono = None
-    if 'cargo' in texto_lower or any(m.endswith('-') for m in montos):
-        cargo = _normalizar_monto(monto_principal)
-    else:
-        abono = _normalizar_monto(monto_principal)
-
-    tipo = 'CARGO' if cargo else 'ABONO'
-
-    return {
-        'Fecha_Oper': fecha_oper,
-        'Fecha_Liq': fecha_liq,
-        'Descripcion': descripcion,
-        'Referencia': '',  # No separado en este formato
-        'Cargo': cargo,
-        'Abono': abono,
-        'Saldo_Oper': None,
-        'Saldo_Liq': None,
-        'Tipo': tipo,
-    }
-
-
-def _asignar_columna_por_x(x: float, header_positions: Dict[str, float]) -> Optional[str]:
-    """Encuentra la columna (header) más cercana en X para un texto dado."""
-    if not header_positions:
-        return None
-    mejor = min(header_positions.items(), key=lambda kv: abs(kv[1] - x))
-    return mejor[0]
-
-
-def _parsear_movimientos_desde_ocr(
-    resultados: List[Tuple[Tuple[float, float, float, float], str, float]],
-    texto: str,
-    log: LogFunc,
-) -> List[Movimiento]:
-    """Construye movimientos a partir de resultados de OCR o texto plano."""
-    if resultados:  # Si hay resultados de EasyOCR, usar el método anterior
-        filas: Dict[int, List[Tuple[float, str]]] = {}
-        for bbox, texto_bbox, _ in resultados:
-            y_center = (bbox[0][1] + bbox[2][1]) / 2
-            x_left = bbox[0][0]
-            y_key = int(round(y_center / 10) * 10)
-            fila = filas.setdefault(y_key, [])
-            fila.append((x_left, texto_bbox))
-
-        movimientos: List[Movimiento] = []
-        for y in sorted(filas.keys()):
-            fila = filas[y]
-            fila.sort(key=lambda x: x[0])
-            linea = ' '.join([texto for _, texto in fila])
-            linea = linea.strip()
-            if linea:
-                mov = _parsear_movimiento_linea(linea)
-                if mov:
-                    movimientos.append(mov)
-        return movimientos
-    else:  # Si no hay resultados (pytesseract), procesar texto línea por línea
-        movimientos: List[Movimiento] = []
-        lineas = [l.strip() for l in texto.splitlines() if l.strip()]
-        for linea in lineas:
-            mov = _parsear_movimiento_linea(linea)
-            if mov:
-                movimientos.append(mov)
-        return movimientos
-
-
 def extraer_movimientos_desde_pdf(
     pdf_path: str, log: LogFunc = print
 ) -> Tuple[List[Movimiento], InfoCuenta]:
-    """Extrae movimientos y encabezado desde un PDF."""
+    """Extrae movimientos y encabezado desde un PDF usando Claude Vision."""
     movimientos: List[Movimiento] = []
     info_cuenta: InfoCuenta = {}
 
@@ -269,38 +241,71 @@ def extraer_movimientos_desde_pdf(
         raise FileNotFoundError(f"No se encontró el archivo PDF: {pdf_path}")
 
     log(f"📄 Abriendo PDF: {ruta.name}")
-    reader = _init_easyocr_reader(log)
-
-    with pdfplumber.open(ruta) as pdf:
-        for idx, pagina in enumerate(pdf.pages, start=1):
-            log(f"  Página {idx}/{len(pdf.pages)}")
-
-            texto = pagina.extract_text() or ''
-            if not texto.strip() and reader:
-                reader_type, reader_obj = reader
-                texto, resultados = _texto_desde_ocr(reader_type, reader_obj, pagina, log)
-                if not texto.strip():
-                    log("    No se pudo extraer texto en esta página (OCR falló).")
-                    continue
-
-                if idx == 1:
-                    info_cuenta = _parsear_encabezado(texto)
-                    log("    Encabezado parseado.")
-
-                movs = _parsear_movimientos_desde_ocr(resultados, texto, log)
-                movimientos.extend(movs)
+    
+    try:
+        cliente = _get_anthropic_client()
+    except ValueError as e:
+        log(f"❌ {e}")
+        raise
+    
+    # Convertir PDF a imágenes
+    try:
+        log(f"📸 Convirtiendo PDF a imágenes...")
+        # Intentar con rutas comunes de poppler
+        poppler_paths = [
+            '/usr/local/bin',
+            '/opt/homebrew/bin',
+            '/usr/bin',
+            None  # Sistema PATH
+        ]
+        
+        imagenes = None
+        for poppler_path in poppler_paths:
+            try:
+                if poppler_path:
+                    imagenes = convert_from_path(str(ruta), dpi=200, poppler_path=poppler_path)
+                else:
+                    imagenes = convert_from_path(str(ruta), dpi=200)
+                break
+            except Exception:
                 continue
+        
+        if not imagenes:
+            raise Exception("No se pudo convertir PDF: poppler no instalado")
+        
+        log(f"  Total de páginas: {len(imagenes)}")
+    except Exception as e:
+        log(f"❌ Error convirtiendo PDF: {e}")
+        raise
 
-            if idx == 1:
+    # Procesar cada página
+    for idx, imagen in enumerate(imagenes, start=1):
+        log(f"  Página {idx}/{len(imagenes)}")
+        
+        # Guardar imagen temporalmente
+        temp_path = f"/tmp/bbva_page_{idx}.png"
+        imagen.save(temp_path, "PNG")
+        
+        try:
+            # Extraer movimientos de esta página con Claude
+            movs, texto = _extraer_movimientos_desde_imagen_claude(temp_path, cliente, log)
+            
+            if idx == 1 and texto:
                 info_cuenta = _parsear_encabezado(texto)
                 log("    Encabezado parseado.")
-
-            # Intentar parsear movimientos a partir del texto plano
-            lineas = [l.strip() for l in texto.splitlines() if l.strip()]
-            for linea in lineas:
-                mov = _parsear_movimiento_linea(linea)
-                if mov:
-                    movimientos.append(mov)
+            
+            if movs:
+                log(f"    ✓ {len(movs)} movimientos encontrados")
+                movimientos.extend(movs)
+            
+        except Exception as e:
+            log(f"    ⚠ Error procesando página {idx}: {e}")
+        finally:
+            # Limpiar imagen temporal
+            try:
+                Path(temp_path).unlink()
+            except:
+                pass
 
     log(f"✓ Movimientos encontrados: {len(movimientos)}")
     return movimientos, info_cuenta
@@ -411,10 +416,6 @@ def generar_excel_movimientos(
 
     log(f"💾 Guardando Excel en: {ruta}")
     wb.save(str(ruta))
-
-
-def _formatear_log(log_func: LogFunc, mensaje: str):
-    log_func(mensaje)
 
 
 if __name__ == '__main__':
